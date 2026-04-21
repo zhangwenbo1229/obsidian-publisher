@@ -1,99 +1,176 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { Notice, Plugin, TFile } from "obsidian";
+import { registerPublisherCommands } from "./commands/registerCommands";
+import { PublisherSettingTab } from "./settings";
+import { CsdnClient } from "./services/csdn/client";
+import { CsdnPublishService } from "./services/csdn/publishService";
+import { type PublisherPluginSettings, mergePublisherSettings } from "./types";
+import { PluginCommandPickerModal, type PluginCommandItem } from "./ui/pluginCommandPickerModal";
 
-// Remember to rename these classes and interfaces!
+export default class ObsidianPublisherPlugin extends Plugin {
+	settings: PublisherPluginSettings;
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+	private csdnClient?: CsdnClient;
+	private csdnPublishService?: CsdnPublishService;
 
-	async onload() {
+	async onload(): Promise<void> {
 		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		this.addSettingTab(new PublisherSettingTab(this.app, this));
+		registerPublisherCommands(this);
+		this.addRibbonIcon("rocket", "显示并执行插件命令", () => {
+			this.openPluginCommandPicker();
 		});
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+		this.registerFileContextMenus();
 	}
 
-	onunload() {
+	onunload(): void {
+		this.csdnClient = undefined;
+		this.csdnPublishService = undefined;
 	}
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+	getCsdnPublishService(): CsdnPublishService {
+		if (!this.csdnPublishService) {
+			this.csdnPublishService = new CsdnPublishService(
+				this.app,
+				() => this.settings.csdn,
+				this.getCsdnClient(),
+				(message, payload) => this.logDebug(message, payload),
+			);
+		}
+		return this.csdnPublishService;
 	}
 
-	async saveSettings() {
+	getCsdnClient(): CsdnClient {
+		if (!this.csdnClient) {
+			this.csdnClient = new CsdnClient(
+				() => this.settings.csdn,
+				(message, payload) => this.logDebug(message, payload),
+			);
+		}
+		return this.csdnClient;
+	}
+
+	async loadSettings(): Promise<void> {
+		this.settings = mergePublisherSettings(await this.loadData());
+	}
+
+	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 	}
-}
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+	private logDebug(message: string, payload?: unknown): void {
+		if (!this.settings.debug) {
+			return;
+		}
+		console.debug(`[obsidian-publisher] ${message}`, payload);
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	private openPluginCommandPicker(): void {
+		const commandManager = this.getCommandManager();
+		if (!commandManager) {
+			new Notice("当前环境不支持读取命令列表。", 8000);
+			return;
+		}
+
+		const pluginCommands = this.getAllPluginCommands(commandManager);
+		if (pluginCommands.length === 0) {
+			new Notice("未找到插件命令。", 5000);
+			return;
+		}
+
+		new PluginCommandPickerModal(this.app, pluginCommands, (command) => {
+			const executed = commandManager.executeCommandById(command.id);
+			if (!executed) {
+				new Notice(`命令执行失败：${command.name}`, 6000);
+			}
+		}).open();
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	private registerFileContextMenus(): void {
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (!(file instanceof TFile) || file.extension !== "md") {
+					return;
+				}
+
+				menu.addItem((item) =>
+					item.setTitle("CSDN Publisher: 发布文章").setIcon("upload").onClick(() => {
+						void this.handleFileMenuAction(file, "create");
+					}),
+				);
+				menu.addItem((item) =>
+					item.setTitle("CSDN Publisher: 更新文章").setIcon("refresh-cw").onClick(() => {
+						void this.handleFileMenuAction(file, "update");
+					}),
+				);
+				menu.addItem((item) =>
+					item.setTitle("CSDN Publisher: 删除文章").setIcon("trash-2").onClick(() => {
+						void this.handleFileMenuAction(file, "delete");
+					}),
+				);
+			}),
+		);
+	}
+
+	private async handleFileMenuAction(file: TFile, mode: "create" | "update" | "delete"): Promise<void> {
+		try {
+			const service = this.getCsdnPublishService();
+			if (mode === "delete") {
+				const result = await service.deleteFilePost(file);
+				new Notice(`CSDN 删除成功：${result.file.basename}（${result.postId}）`);
+				return;
+			}
+
+			const result =
+				mode === "create" ? await service.publishFileAsCreate(file) : await service.updateFilePost(file);
+			const actionText = mode === "create" ? "发布" : "更新";
+			new Notice(`CSDN ${actionText}成功：${result.file.basename}（${result.postId}）`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			new Notice(`CSDN 操作失败：${message}`, 8000);
+		}
+	}
+
+	private getCommandManager():
+		| {
+				listCommands: () => PluginCommandItem[];
+				executeCommandById: (commandId: string) => boolean;
+		  }
+		| undefined {
+		const appWithCommands = this.app as Plugin["app"] & {
+			commands?: {
+				listCommands?: () => PluginCommandItem[];
+				executeCommandById?: (commandId: string) => boolean;
+			};
+		};
+
+		const manager = appWithCommands.commands;
+		if (!manager?.listCommands || !manager?.executeCommandById) {
+			return undefined;
+		}
+
+		return {
+			listCommands: manager.listCommands.bind(manager),
+			executeCommandById: manager.executeCommandById.bind(manager),
+		};
+	}
+
+	private getAllPluginCommands(commandManager: { listCommands: () => PluginCommandItem[] }): PluginCommandItem[] {
+		const appWithPlugins = this.app as Plugin["app"] & {
+			plugins?: {
+				plugins?: Record<string, unknown>;
+			};
+		};
+		const pluginIds = new Set(Object.keys(appWithPlugins.plugins?.plugins ?? {}));
+
+		return commandManager
+			.listCommands()
+			.filter((command) => {
+				if (!command?.id || !command?.name) {
+					return false;
+				}
+				const prefix = command.id.split(":")[0] ?? "";
+				return pluginIds.has(prefix);
+			})
+			.sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"));
 	}
 }
